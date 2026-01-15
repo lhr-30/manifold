@@ -40,18 +40,23 @@ def run_client(rank, args):
     block_elems = max(1, block_bytes // elem_size)
     block_bytes = block_elems * elem_size
 
-    host_cache, gpu_cache = allocate_cache(args.num_blocks, block_elems, dtype, args.pin, device)
-    stream = torch.cuda.Stream(device=device)
+    host_cache = torch.empty((args.num_blocks, block_elems), dtype=dtype, device="cpu", pin_memory=args.pin)
+    if dtype in (torch.int8, torch.uint8, torch.int32):
+        host_cache.random_(0, 127)
+    else:
+        host_cache.uniform_(0, 1)
+    devices = [torch.device(f"cuda:{idx}") for idx in range(args.num_clients)]
+    streams = [torch.cuda.Stream(device=dev) for dev in devices]
+    gpu_caches = [torch.empty((args.num_blocks, block_elems), dtype=dtype, device=dev) for dev in devices]
 
     util_ratio = max(0.0, min(1.0, args.pcie_util / 100.0))
     rng = random.Random(args.seed + rank) if args.randomize else None
 
     if args.mode == "baseline":
-        load_manager = BaselineLoadManager(host_cache, gpu_cache, stream, args.pin, device)
+        load_manager = BaselineLoadManager(host_cache, gpu_caches, streams, args.pin, devices)
     else:
-        device_handlers = [torch.device(f"cuda:{idx}") for idx in range(args.num_clients)]
         load_manager = OptimizedLoadManager(
-            host_cache, gpu_cache, block_elems, stream, args.pin, device, device_handlers
+            host_cache, block_elems, args.pin, devices, streams, gpu_caches
         )
 
     process = PcieLoadProcess(

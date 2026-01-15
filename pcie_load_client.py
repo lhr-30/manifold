@@ -63,7 +63,7 @@ class PcieLoadProcess:
                 continue
 
             bytes_moved = request.num_blocks * self.block_bytes
-            h2d_seconds = self.load_manager.load(request.indices_cpu)
+            h2d_seconds = self.load_manager.load(request.indices_cpu, self.client.device_id)
             if it >= self.warmup:
                 per_iter_gbps.append(self._gbps(bytes_moved, h2d_seconds))
             maybe_sleep(h2d_seconds, self.util_ratio, self.sleep_min_ms, self.sleep_max_ms, self.rng)
