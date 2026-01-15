@@ -1,0 +1,12 @@
+#!/bin/bash
+#PBS -l walltime=12:00:01
+#PBS -j oe
+#PBS -o ./log/create.log
+
+echo "Running on nodes: $(cat $PBS_NODEFILE)"
+# enroot create --name sglang /scratch/users/ntu/hongrui0/sif_images/sglang.sqsh > create.log 2>&1
+while true; do
+    echo "Still alive at $(date)" 
+    awk 'BEGIN { for(i=0;i<1e6;i++) x=sin(i) }'
+    sleep 60  
+done
