@@ -3,44 +3,43 @@
 import torch
 
 class LoadManager:
-    def load(self, indices_cpu, device_id):  # pragma: no cover - interface
+    def load(self, indices_cpu, indices_gpu, device_id):  # pragma: no cover - interface
         raise NotImplementedError
 
 
 class BaselineLoadManager(LoadManager):
-    def __init__(self, host_cache, gpu_caches, streams, pin, devices):
+    def __init__(self, host_cache, gpu_cache, stream, pin, device):
         self.host_cache = host_cache
-        self.gpu_caches = gpu_caches
-        self.streams = streams
+        self.gpu_cache = gpu_cache
+        self.stream = stream
+        self.device = device
         self.pin = pin
-        self.devices = devices
-        self.copy_start = [torch.cuda.Event(enable_timing=True) for _ in devices]
-        self.copy_end = [torch.cuda.Event(enable_timing=True) for _ in devices]
+        self.copy_start = torch.cuda.Event(enable_timing=True)
+        self.copy_end = torch.cuda.Event(enable_timing=True)
 
-    def load(self, indices_cpu, device_id):
-        stream = self.streams[device_id]
-        device = self.devices[device_id]
-        with torch.cuda.stream(stream):
-            self.copy_start[device_id].record(stream)
+    def load(self, indices_cpu, indices_gpu, device_id):
+        # print(f"Loading to device {device} indices {indices_cpu}")
+        with torch.cuda.stream(self.stream):
+            self.copy_start.record(self.stream)
             host_slice = self.host_cache.index_select(0, indices_cpu)
-            dev_slice = host_slice.to(device=device, non_blocking=self.pin)
-            self.gpu_caches[device_id].index_copy_(0, indices_cpu.to(device=device), dev_slice)
-            self.copy_end[device_id].record(stream)
-        stream.synchronize()
-        return self.copy_start[device_id].elapsed_time(self.copy_end[device_id]) / 1e3
+            dev_slice = host_slice.to(device=self.device, non_blocking=self.pin)
+            self.gpu_cache.index_copy_(0, indices_gpu, dev_slice)
+            self.copy_end.record(self.stream)
+        self.stream.synchronize()
+        return self.copy_start.elapsed_time(self.copy_end) / 1e3
 
 
 class OptimizedLoadManager(LoadManager):
     def __init__(
         self,
-        host_cache,
+        host_caches,
         block_elems,
         pin,
         devices,
         streams,
         gpu_caches,
     ):
-        self.host_cache = host_cache
+        self.host_caches = host_caches
         self.block_elems = block_elems
         self.pin = pin
         self.devices = devices
@@ -49,7 +48,7 @@ class OptimizedLoadManager(LoadManager):
         self.copy_start = [torch.cuda.Event(enable_timing=True) for _ in devices]
         self.copy_end = [torch.cuda.Event(enable_timing=True) for _ in devices]
 
-    def load(self, indices_cpu, device_id):
+    def load(self, indices_cpu, indices_gpu, device_id):
         num_blocks = indices_cpu.numel()
         if num_blocks == 0:
             return 0.0
@@ -58,12 +57,12 @@ class OptimizedLoadManager(LoadManager):
         load_buffers = []
         for idx, device in enumerate(self.devices):
             load_buffer = torch.zeros(
-                (num_blocks, self.block_elems), dtype=self.host_cache.dtype, device=device
+                (num_blocks, self.block_elems), dtype=self.host_caches[device_id].dtype, device=device
             )
             stream = self.streams[idx]
             with torch.cuda.stream(stream):
                 self.copy_start[idx].record(stream)
-                host_slice = self.host_cache.index_select(0, indices_cpu)
+                host_slice = self.host_caches[device_id].index_select(0, indices_cpu)
                 dev_slice = host_slice.to(device=device, non_blocking=self.pin)
                 load_buffer.index_copy_(0, positions.to(device=device), dev_slice)
                 self.copy_end[idx].record(stream)
@@ -78,7 +77,7 @@ class OptimizedLoadManager(LoadManager):
 
         target_device = self.devices[device_id]
         reduce_buffer = torch.zeros(
-            (num_blocks, self.block_elems), dtype=self.host_cache.dtype, device=target_device
+            (num_blocks, self.block_elems), dtype=self.host_caches[device_id].dtype, device=target_device
         )
         for idx, device in enumerate(self.devices):
             if device == target_device:
@@ -87,6 +86,6 @@ class OptimizedLoadManager(LoadManager):
                 reduce_buffer.add_(load_buffers[idx].to(device=target_device))
 
         self.gpu_caches[device_id].index_copy_(
-            0, indices_cpu.to(device=target_device), reduce_buffer
+            0, indices_gpu, reduce_buffer
         )
         return copy_seconds
