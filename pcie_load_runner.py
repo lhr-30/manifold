@@ -20,13 +20,13 @@ def bytes_per_elem(dtype: torch.dtype) -> int:
     return torch.tensor([], dtype=dtype).element_size()
 
 
-def allocate_cache(num_blocks, block_elems, dtype, pin, device):
-    host_cache = torch.empty((num_blocks, block_elems), dtype=dtype, device="cpu", pin_memory=pin)
+def allocate_cache(num_cpu_blocks, num_gpu_blocks, block_elems, dtype, pin, device):
+    host_cache = torch.empty((num_cpu_blocks, block_elems), dtype=dtype, device="cpu", pin_memory=pin)
     if dtype in (torch.int8, torch.uint8, torch.int32):
         host_cache.random_(0, 127)
     else:
         host_cache.uniform_(0, 1)
-    gpu_cache = torch.empty((num_blocks, block_elems), dtype=dtype, device=device)
+    gpu_cache = torch.empty((num_gpu_blocks, block_elems), dtype=dtype, device=device)
     return host_cache, gpu_cache
 
 
@@ -51,7 +51,9 @@ def run_client_baseline(rank, args, load_managers):
     client = PcieLoadClient(
         rank=rank,
         device_id=rank,
-        num_blocks=args.num_blocks,
+        device=device,
+        num_cpu_blocks=args.num_cpu_blocks,
+        num_gpu_blocks=args.num_gpu_blocks,
         read_min_blocks=args.read_min_blocks,
         read_max_blocks=args.read_max_blocks,
         util_ratio=util_ratio,
@@ -73,13 +75,52 @@ def run_client_baseline(rank, args, load_managers):
     print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
 
 def run_client_optimized(rank, args, load_manager):
-    # TODO
-    pass
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    util_ratio = max(0.0, min(1.0, args.pcie_util / 100.0))
+    rng = random.Random(args.seed + rank) if args.randomize else None
+    block_bytes = int(args.block_mb * 1e6)
+    process = PcieLoadProcess(
+        None,
+        load_manager,
+        block_bytes,
+        util_ratio,
+        args.warmup,
+        args.iters,
+        args.sleep_min_ms,
+        args.sleep_max_ms,
+        rng,
+    )
+    client = PcieLoadClient(
+        rank=rank,
+        device_id=rank,
+        device=device,
+        num_cpu_blocks=args.num_cpu_blocks,
+        num_gpu_blocks=args.num_gpu_blocks,
+        read_min_blocks=args.read_min_blocks,
+        read_max_blocks=args.read_max_blocks,
+        util_ratio=util_ratio,
+        seed=args.seed,
+        randomize=args.randomize,
+        load_manager=load_manager,
+        process=process,
+    )
+    process.client = client
+
+    per_iter_gbps = client.run()
+    stats_tensor = torch.tensor(
+        [stats.mean(per_iter_gbps), stats.median(per_iter_gbps)], dtype=torch.float64, device=device
+    )
+    print(
+        f"Rank{rank} PCIe H2D bandwidth (GB/s): "
+        f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
+    )
+    print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["baseline", "optimized"], default="baseline")
-    ap.add_argument("--num-gpu-blocks", type=int, default=2048, help="Number of blocks in the KV cache per GPU.")
+    ap.add_argument("--num-gpu-blocks", type=int, default=256, help="Number of blocks in the KV cache per GPU.")
     ap.add_argument("--num-cpu-blocks", type=int, default=2048, help="Number of blocks in the KV cache on CPU.")
     ap.add_argument("--block-mb", type=float, default=16.0, help="Block size (MB) for each KV cache block.")
     ap.add_argument("--read-min-blocks", type=int, default=32)
@@ -111,8 +152,8 @@ def main():
     print(f"Mode: {args.mode}")
     print(f"Clients: {args.num_clients}, dtype: {DTYPE_MAP[args.dtype]}, pin: {args.pin}")
     print(
-        f"Blocks: {args.num_blocks}, block: {args.block_mb:.2f} MB, "
-        f"read range: [{args.read_min_blocks}, {args.read_max_blocks}] blocks"
+        f"CPU blocks: {args.num_cpu_blocks}, GPU blocks: {args.num_gpu_blocks}, "
+        f"block: {args.block_mb:.2f} MB, read range: [{args.read_min_blocks}, {args.read_max_blocks}] blocks"
     )
     print(f"PCIe utilization target: {args.pcie_util:.1f}%")
     print(f"Sleep jitter: {args.sleep_min_ms:.2f}~{args.sleep_max_ms:.2f} ms")
@@ -120,19 +161,39 @@ def main():
 
     dtype = DTYPE_MAP[args.dtype]
     elem_size = bytes_per_elem(dtype)
+    block_bytes = int(args.block_mb * 1e6)
     block_elems = max(1, block_bytes // elem_size)
     block_bytes = block_elems * elem_size
     devices = [torch.device(f"cuda:{idx}") for idx in range(args.num_clients)]
-    host_caches = [torch.empty((args.num_cpu_blocks, block_elems), dtype=dtype, device="cpu", pin_memory=args.pin) for _ in range(args.num_clients)]
-    gpu_caches = [torch.empty((args.num_gpu_blocks, block_elems), dtype=dtype, device=devices[idx]) for idx in range(args.num_clients)]
+    host_caches = []
+    gpu_caches = []
+    for idx in range(args.num_clients):
+        host_cache, gpu_cache = allocate_cache(
+            args.num_cpu_blocks,
+            args.num_gpu_blocks,
+            block_elems,
+            dtype,
+            args.pin,
+            devices[idx],
+        )
+        host_caches.append(host_cache)
+        gpu_caches.append(gpu_cache)
     streams = [torch.cuda.Stream(device=devices[i]) for i in range(args.num_clients)]
-    # TODO
     if args.mode == "baseline":
-        load_managers = [BaselineLoadManager(host_caches[i], gpu_caches[i], streams[i], args.pin, devices[i]) for i in range(args.num_clients)]
+        load_managers = [
+            BaselineLoadManager(host_caches[i], gpu_caches[i], streams[i], args.pin, devices[i])
+            for i in range(args.num_clients)
+        ]
         mp.spawn(run_client_baseline, args=(args, load_managers), nprocs=args.num_clients, join=True)
     else:
-        # TODO
-        load_manager = OptimizedLoadManager()
+        load_manager = OptimizedLoadManager(
+            host_caches=host_caches,
+            block_elems=block_elems,
+            pin=args.pin,
+            devices=devices,
+            streams=streams,
+            gpu_caches=gpu_caches,
+        )
         mp.spawn(run_client_optimized, args=(args, load_manager), nprocs=args.num_clients, join=True)
 
 

@@ -5,10 +5,11 @@ import torch
 
 
 class PcieLoadRequest:
-    def __init__(self, owner_rank, num_blocks, indices_cpu):
+    def __init__(self, owner_rank, num_blocks, indices_cpu, indices_gpu):
         self.owner_rank = owner_rank
         self.num_blocks = num_blocks
         self.indices_cpu = indices_cpu
+        self.indices_gpu = indices_gpu
 
 
 def compute_sleep_seconds(h2d_seconds, util_ratio, base_sleep_ms):
@@ -63,7 +64,7 @@ class PcieLoadProcess:
                 continue
 
             bytes_moved = request.num_blocks * self.block_bytes
-            h2d_seconds = self.load_manager.load(request.indices_cpu, self.client.device_id)
+            h2d_seconds = self.load_manager.load(request.indices_cpu, request.indices_gpu, self.client.device_id)
             if it >= self.warmup:
                 per_iter_gbps.append(self._gbps(bytes_moved, h2d_seconds))
             maybe_sleep(h2d_seconds, self.util_ratio, self.sleep_min_ms, self.sleep_max_ms, self.rng)
@@ -79,7 +80,9 @@ class PcieLoadClient:
         self,
         rank,
         device_id,
-        num_blocks,
+        device,
+        num_cpu_blocks,
+        num_gpu_blocks,
         read_min_blocks,
         read_max_blocks,
         util_ratio,
@@ -90,7 +93,9 @@ class PcieLoadClient:
     ):
         self.rank = rank
         self.device_id = device_id
-        self.num_blocks = num_blocks
+        self.device = device
+        self.num_cpu_blocks = num_cpu_blocks
+        self.num_gpu_blocks = num_gpu_blocks
         self.read_min_blocks = read_min_blocks
         self.read_max_blocks = read_max_blocks
         self.util_ratio = util_ratio
@@ -102,18 +107,23 @@ class PcieLoadClient:
         torch.manual_seed(seed + rank)
 
     def build_request(self):
-        if self.util_ratio <= 0:
-            return PcieLoadRequest(self.rank, 0, torch.empty((0,), dtype=torch.int64, device="cpu"))
         if self.randomize:
             num_blocks = self.rng.randint(self.read_min_blocks, self.read_max_blocks)
-            selected = self.rng.sample(range(self.num_blocks), num_blocks)
-            indices = torch.tensor(selected, dtype=torch.int64, device="cpu")
+            selected_cpu = self.rng.sample(range(self.num_cpu_blocks), num_blocks)
+            indices_cpu = torch.tensor(selected_cpu, dtype=torch.int64, device="cpu")
+            selected_gpu = self.rng.sample(range(self.num_gpu_blocks), num_blocks)
+            indices_gpu = torch.tensor(selected_gpu, dtype=torch.int64, device="cpu")
         else:
             num_blocks = self.read_min_blocks
             start = (self.iteration * num_blocks) % self.num_blocks
-            indices = torch.arange(start, start + num_blocks, dtype=torch.int64, device="cpu") % self.num_blocks
+            indices_cpu = torch.arange(start, start + num_blocks, dtype=torch.int64, device="cpu") % self.num_cpu_blocks
+            start_gpu = (self.iteration * num_blocks) % self.num_gpu_blocks
+            indices_gpu = (
+                torch.arange(start_gpu, start_gpu + num_blocks, dtype=torch.int64, device="cpu")
+                % self.num_gpu_blocks
+            )
             self.iteration += 1
-        return PcieLoadRequest(self.rank, num_blocks, indices)
+        return PcieLoadRequest(self.rank, num_blocks, indices_cpu, indices_gpu)
 
     def run(self):
         return self.process.run()
