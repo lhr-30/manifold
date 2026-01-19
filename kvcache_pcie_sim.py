@@ -21,11 +21,14 @@ class BaselineLoadManager(LoadManager):
         # print(f"Loading to device {device} indices {indices_cpu}")
         with torch.cuda.stream(self.stream):
             self.copy_start.record(self.stream)
-            host_slice = self.host_cache.index_select(0, indices_cpu)
-            dev_slice = host_slice.to(device=self.device, non_blocking=self.pin)
-            self.gpu_cache.index_copy_(0, indices_gpu, dev_slice)
+            for cpu_idx, gpu_idx in zip(indices_cpu, indices_gpu):
+                self.gpu_cache[gpu_idx].copy_(self.host_cache[cpu_idx], non_blocking=self.pin)
             self.copy_end.record(self.stream)
         self.stream.synchronize()
+        load_time = self.copy_start.elapsed_time(self.copy_end) / 1e3
+        bytes_per_block = self.host_cache[0].numel() * self.host_cache[0].element_size()
+        load_data_size = len(indices_cpu) * bytes_per_block / 1e6
+        print(f"device = {self.device}, load time = {load_time} seconds, load data size = {load_data_size} MB, Bandwidth = {load_data_size / 1e3 / load_time } GB/s")
         return self.copy_start.elapsed_time(self.copy_end) / 1e3
 
 

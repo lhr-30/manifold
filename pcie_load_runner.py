@@ -30,10 +30,12 @@ def allocate_cache(num_cpu_blocks, num_gpu_blocks, block_elems, dtype, pin, devi
     return host_cache, gpu_cache
 
 
-def run_client_baseline(rank, args, load_managers):
+def run_client_baseline(rank, args, host_caches, gpu_caches):
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
-    load_manager = load_managers[rank]
+    host_cache = host_caches[rank]
+    gpu_cache = gpu_caches[rank]
+    load_manager = BaselineLoadManager(host_cache, gpu_cache, torch.cuda.Stream(device=device), args.pin, device)
     util_ratio = max(0.0, min(1.0, args.pcie_util / 100.0))
     rng = random.Random(args.seed + rank) if args.randomize else None
     block_bytes = int(args.block_mb * 1e6)
@@ -121,8 +123,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["baseline", "optimized"], default="baseline")
     ap.add_argument("--num-gpu-blocks", type=int, default=256, help="Number of blocks in the KV cache per GPU.")
-    ap.add_argument("--num-cpu-blocks", type=int, default=2048, help="Number of blocks in the KV cache on CPU.")
-    ap.add_argument("--block-mb", type=float, default=16.0, help="Block size (MB) for each KV cache block.")
+    ap.add_argument("--num-cpu-blocks", type=int, default=512, help="Number of blocks in the KV cache on CPU.")
+    ap.add_argument("--block-mb", type=float, default=8.0, help="Block size (MB) for each KV cache block.")
     ap.add_argument("--read-min-blocks", type=int, default=32)
     ap.add_argument("--read-max-blocks", type=int, default=32)
     ap.add_argument("--iters", type=int, default=50)
@@ -179,12 +181,10 @@ def main():
         host_caches.append(host_cache)
         gpu_caches.append(gpu_cache)
     streams = [torch.cuda.Stream(device=devices[i]) for i in range(args.num_clients)]
+    print("Caches allocated.")
     if args.mode == "baseline":
-        load_managers = [
-            BaselineLoadManager(host_caches[i], gpu_caches[i], streams[i], args.pin, devices[i])
-            for i in range(args.num_clients)
-        ]
-        mp.spawn(run_client_baseline, args=(args, load_managers), nprocs=args.num_clients, join=True)
+        # mp.spawn(run_client_baseline, args=(args, host_caches, gpu_caches), nprocs=args.num_clients, join=True)
+        run_client_baseline(0, args, host_caches, gpu_caches)
     else:
         load_manager = OptimizedLoadManager(
             host_caches=host_caches,

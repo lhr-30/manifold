@@ -64,6 +64,7 @@ class PcieLoadProcess:
                 continue
 
             bytes_moved = request.num_blocks * self.block_bytes
+            # bytes_moved = 128 * self.block_bytes
             h2d_seconds = self.load_manager.load(request.indices_cpu, request.indices_gpu, self.client.device_id)
             if it >= self.warmup:
                 per_iter_gbps.append(self._gbps(bytes_moved, h2d_seconds))
@@ -110,18 +111,22 @@ class PcieLoadClient:
         if self.randomize:
             num_blocks = self.rng.randint(self.read_min_blocks, self.read_max_blocks)
             selected_cpu = self.rng.sample(range(self.num_cpu_blocks), num_blocks)
-            indices_cpu = torch.tensor(selected_cpu, dtype=torch.int64, device="cpu")
+            # indices_cpu = torch.tensor(selected_cpu, dtype=torch.int64, device="cpu")
             selected_gpu = self.rng.sample(range(self.num_gpu_blocks), num_blocks)
-            indices_gpu = torch.tensor(selected_gpu, dtype=torch.int64, device="cpu")
+            # indices_gpu = torch.tensor(selected_gpu, dtype=torch.int64, device=self.device)
+            indices_cpu = selected_cpu
+            indices_gpu = selected_gpu
         else:
             num_blocks = self.read_min_blocks
-            start = (self.iteration * num_blocks) % self.num_blocks
+            start = (self.iteration * num_blocks) % self.num_cpu_blocks
             indices_cpu = torch.arange(start, start + num_blocks, dtype=torch.int64, device="cpu") % self.num_cpu_blocks
             start_gpu = (self.iteration * num_blocks) % self.num_gpu_blocks
             indices_gpu = (
-                torch.arange(start_gpu, start_gpu + num_blocks, dtype=torch.int64, device="cpu")
+                torch.arange(start_gpu, start_gpu + num_blocks, dtype=torch.int64, device=self.device)
                 % self.num_gpu_blocks
             )
+            indices_cpu = [i for i in range(start, start + num_blocks)]
+            indices_gpu = [i for i in range(start_gpu, start_gpu + num_blocks)]
             self.iteration += 1
         return PcieLoadRequest(self.rank, num_blocks, indices_cpu, indices_gpu)
 
