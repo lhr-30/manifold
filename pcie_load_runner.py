@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import random
 import socket
@@ -24,6 +25,18 @@ DTYPE_MAP = {
     "uint8": torch.uint8,
     "int32": torch.int32,
 }
+
+LOGGER_FORMAT = "%(asctime)s %(processName)s %(levelname)s %(name)s: %(message)s"
+
+
+def configure_logging(log_file: str | None) -> None:
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    while root_logger.handlers:
+        root_logger.handlers.pop()
+    handler = logging.FileHandler(log_file) if log_file else logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(LOGGER_FORMAT))
+    root_logger.addHandler(handler)
 
 def bytes_per_elem(dtype: torch.dtype) -> int:
     return torch.tensor([], dtype=dtype).element_size()
@@ -69,6 +82,8 @@ def bind_cpu(rank: int, cores_per_proc: int):
     # torch.set_num_interop_threads(1)
 
 def run_client_baseline(rank, args):
+    configure_logging(os.path.join(args.log_dir, f"client{rank + 1}.log"))
+    logger = logging.getLogger(__name__)
     bind_cpu(rank, args.cores_per_proc)
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
@@ -120,15 +135,17 @@ def run_client_baseline(rank, args):
     stats_tensor = torch.tensor(
         [stats.mean(per_iter_gbps), stats.median(per_iter_gbps)], dtype=torch.float64, device=device
     )
-    print()
-    print(
+    logger.info("")
+    logger.info(
         f"Rank{rank} PCIe H2D bandwidth (GB/s): "
         f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}",
         f"affinity = {sorted(os.sched_getaffinity(0))}"
     )
-    print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
+    logger.info("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
 
 def run_client_optimized(rank, args, queues, host_caches):
+    configure_logging(os.path.join(args.log_dir, f"client{rank + 1}.log"))
+    logger = logging.getLogger(__name__)
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
@@ -196,17 +213,26 @@ def run_client_optimized(rank, args, queues, host_caches):
     stats_tensor = torch.tensor(
         [stats.mean(per_iter_gbps), stats.median(per_iter_gbps)], dtype=torch.float64, device=device
     )
-    print(
+    logger.info(
         f"Rank{rank} PCIe H2D bandwidth (GB/s): "
         f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
     )
-    print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
+    logger.info("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
     dist.barrier(device_ids=[rank])
-    print("Rank {rank} shutting down load manager...")
+    logger.info("Rank %s shutting down load manager...", rank)
     load_manager.shutdown()
     dist.destroy_process_group()
 
+def run_manager_process(load_manager, log_file: str) -> None:
+    configure_logging(log_file)
+    logger = logging.getLogger(__name__)
+    logger.info("Load manager process starting.")
+    load_manager.serve()
+    logger.info("Load manager process exiting.")
+
 def main():
+    configure_logging(None)
+    logger = logging.getLogger(__name__)
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["baseline", "optimized"], default="baseline")
     ap.add_argument("--num-gpu-blocks", type=int, default=256, help="Number of blocks in the KV cache per GPU.")
@@ -224,7 +250,11 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--randomize", action="store_true", help="Enable randomized block sizes and sleep jitter.")
     ap.add_argument("--cores-per-proc", type=int, help="set CPU cores per process for binding.", default=6)
+    ap.add_argument("--log-dir", type=str, default="logs", help="Directory to write per-process logs.")
     args = ap.parse_args()
+    os.makedirs(args.log_dir, exist_ok=True)
+    configure_logging(os.path.join(args.log_dir, "main.log"))
+    logger = logging.getLogger(__name__)
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is not available.")
@@ -238,16 +268,16 @@ def main():
         if args.sleep_min_ms != args.sleep_max_ms:
             raise SystemExit("For deterministic runs, sleep-min-ms must equal sleep-max-ms.")
 
-    print("=== KV Cache PCIe Simulation ===")
-    print(f"Mode: {args.mode}")
-    print(f"Clients: {args.num_clients}, dtype: {DTYPE_MAP[args.dtype]}, pin: {args.pin}")
-    print(
+    logger.info("=== KV Cache PCIe Simulation ===")
+    logger.info("Mode: %s", args.mode)
+    logger.info("Clients: %s, dtype: %s, pin: %s", args.num_clients, DTYPE_MAP[args.dtype], args.pin)
+    logger.info(
         f"CPU blocks: {args.num_cpu_blocks}, GPU blocks: {args.num_gpu_blocks}, "
         f"block: {args.block_mb:.2f} MB, read range: [{args.read_min_blocks}, {args.read_max_blocks}] blocks"
     )
-    print(f"PCIe utilization target: {args.pcie_util:.1f}%")
-    print(f"Sleep jitter: {args.sleep_min_ms:.2f}~{args.sleep_max_ms:.2f} ms")
-    print()
+    logger.info("PCIe utilization target: %.1f%%", args.pcie_util)
+    logger.info("Sleep jitter: %.2f~%.2f ms", args.sleep_min_ms, args.sleep_max_ms)
+    logger.info("")
 
     if args.mode == "baseline":
         # mp.spawn(run_client_baseline, args=(args, ), nprocs=args.num_clients, join=True)
@@ -282,7 +312,11 @@ def main():
             complete_queue=complete_queue,
             num_clients=args.num_clients,
         )
-        manager_process = mp.Process(target=load_manager.serve, daemon=True)
+        manager_process = mp.Process(
+            target=run_manager_process,
+            args=(load_manager, os.path.join(args.log_dir, "manager.log")),
+            daemon=True,
+        )
         manager_process.start()
         queues = {
             "request": request_queue,
@@ -297,7 +331,7 @@ def main():
             join=True,
         )
         
-        print("Shutting down load manager...")
+        logger.info("Shutting down load manager...")
         request_queue.put(None)
         manager_process.join(timeout=5)
 
