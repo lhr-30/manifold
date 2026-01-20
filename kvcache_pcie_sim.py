@@ -78,6 +78,7 @@ class OptimizedLoadManager(LoadManager):
                 request_id=request.request_id,
                 owner_rank=request.owner_rank,
                 worker_rank=rank,
+                host_cache_rank=request.owner_rank,
                 indices_cpu=indices_cpu[start:end],
                 indices_gpu=indices_gpu[start:end],
             )
@@ -98,6 +99,7 @@ class LoadTask:
     request_id: int
     owner_rank: int
     worker_rank: int
+    host_cache_rank: int
     indices_cpu: Sequence[int]
     indices_gpu: Sequence[int]
 
@@ -113,9 +115,10 @@ class ReduceCommand:
 
 @dataclass(frozen=True)
 class OptimizedLoadWorker:
-    def __init__(self, rank, host_cache, gpu_cache, stream, pin, device):
+    def __init__(self, rank, host_cache, host_caches, gpu_cache, stream, pin, device):
         self.rank = rank
         self.host_cache = host_cache
+        self.host_caches = host_caches
         self.gpu_cache = gpu_cache
         self.stream = stream
         self.pin = pin
@@ -131,9 +134,10 @@ class OptimizedLoadWorker:
         indices_cpu = torch.tensor(task.indices_cpu, dtype=torch.int64, device="cpu")
         indices_gpu = torch.tensor(task.indices_gpu, dtype=torch.int64, device=self.device)
         self._task_indices[task.request_id] = indices_gpu
+        host_cache = self.host_caches[task.host_cache_rank]
         with torch.cuda.stream(self.stream):
             self.copy_start.record(self.stream)
-            host_slice = self.host_cache.index_select(0, indices_cpu)
+            host_slice = host_cache.index_select(0, indices_cpu)
             dev_slice = host_slice.to(device=self.device, non_blocking=self.pin)
             self.gpu_cache.index_copy_(0, indices_gpu, dev_slice)
             self.copy_end.record(self.stream)
