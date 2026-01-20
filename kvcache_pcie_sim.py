@@ -44,11 +44,13 @@ class OptimizedLoadManager(LoadManager):
         request_queue,
         task_queues,
         reduce_queues,
+        complete_queue,
         num_clients,
     ):
         self.request_queue = request_queue
         self.task_queues = task_queues
         self.reduce_queues = reduce_queues
+        self.complete_queue = complete_queue
         self.num_clients = num_clients
 
     def serve(self):
@@ -56,6 +58,7 @@ class OptimizedLoadManager(LoadManager):
             request = self.request_queue.get()
             if request is None:
                 break
+            print(f"Manager received load request id {request.request_id} from owner rank {request.owner_rank}")
             worker_ranks = self._dispatch_tasks(request)
             self.reduce_queues[request.owner_rank].put(
                 ReduceCommand(
@@ -65,6 +68,15 @@ class OptimizedLoadManager(LoadManager):
                     contributors=worker_ranks,
                 )
             )
+            while True:
+                completion = self.complete_queue.get()
+                if completion is None:
+                    return
+                if (
+                    completion.request_id == request.request_id
+                    and completion.owner_rank == request.owner_rank
+                ):
+                    break
 
     def _dispatch_tasks(self, request):
         indices_cpu = list(request.indices_cpu)
@@ -109,6 +121,10 @@ class ReduceCommand:
     action: str
     contributors: List[int]
 
+@dataclass
+class LoadComplete:
+    request_id: int
+    owner_rank: int
 
 class OptimizedLoadWorker:
     def __init__(self, rank, host_cache, host_caches, gpu_cache, stream, pin, device):
@@ -122,6 +138,7 @@ class OptimizedLoadWorker:
         self.copy_start = torch.cuda.Event(enable_timing=True)
         self.copy_end = torch.cuda.Event(enable_timing=True)
         self._task_indices: Dict[int, torch.Tensor] = {}
+        self._dist_lock = threading.Lock()
 
     def execute_task(self, task: LoadTask):
         if not task.indices_cpu:
@@ -152,10 +169,21 @@ class OptimizedLoadWorker:
         pending_meta = []
         for rank in command.contributors:
             if rank == command.owner_rank:
+                print(
+                    f"Worker rank {self.rank}, skipping receiving shard from owner rank {rank} "
+                    f"for request id {command.request_id}")
                 continue
-            size = torch.empty((1,), dtype=torch.int64, device=self.device)
-            dist.recv(size, src=rank)
-            print(f"Worker rank {self.rank}, receiving shard from contributor rank {rank} for request id {command.request_id}, size = {size.item()}")
+            print(
+                f"Worker rank {self.rank}, preparing to receive shard from contributor rank {rank} "
+                f"for request id {command.request_id}"
+            )
+            with self._dist_lock:
+                size = torch.empty((1,), dtype=torch.int64, device=self.device)
+                dist.recv(size, src=rank)
+            print(
+                f"Worker rank {self.rank}, receiving shard from contributor rank {rank} "
+                f"for request id {command.request_id}, size = {size.item()}"
+            )
             num_indices = int(size.item())
             if num_indices == 0:
                 continue
@@ -169,8 +197,9 @@ class OptimizedLoadWorker:
             pending.append(dist.P2POp(dist.irecv, data, src=rank))
             pending_meta.append((indices, data))
         if pending:
-            for work in dist.batch_isend_irecv(pending):
-                work.wait()
+            with self._dist_lock:
+                for work in dist.batch_isend_irecv(pending):
+                    work.wait()
             print(f"Worker rank {self.rank}, finished receiving shards for request id {command.request_id}")
             for indices, data in pending_meta:
                 self.gpu_cache.index_copy_(0, indices, data)
@@ -179,12 +208,15 @@ class OptimizedLoadWorker:
         torch.cuda.set_device(self.device)
         indices = self._task_indices.pop(request_id, None)
         if indices is None:
-            size = torch.zeros((1,), dtype=torch.int64, device=self.device)
-            dist.send(size, dst=owner_rank)
+            with self._dist_lock:
+                size = torch.zeros((1,), dtype=torch.int64, device=self.device)
+                dist.send(size, dst=owner_rank)
             return
         num_indices = int(indices.numel())
-        size = torch.tensor([num_indices], dtype=torch.int64, device=self.device)
-        dist.send(size, dst=owner_rank)
+        print(f"Worker rank {self.rank}, sending shard to owner rank {owner_rank} for request id {request_id}, num indices = {num_indices}")
+        with self._dist_lock:
+            size = torch.tensor([num_indices], dtype=torch.int64, device=self.device)
+            dist.send(size, dst=owner_rank)
         if num_indices == 0:
             return
         data = self.gpu_cache.index_select(0, indices)
@@ -192,8 +224,9 @@ class OptimizedLoadWorker:
             dist.P2POp(dist.isend, indices, dst=owner_rank),
             dist.P2POp(dist.isend, data, dst=owner_rank),
         ]
-        for work in dist.batch_isend_irecv(ops):
-            work.wait()
+        with self._dist_lock:
+            for work in dist.batch_isend_irecv(ops):
+                work.wait()
         print(f"Finish sending: Worker rank {self.rank}, sent shard to owner rank {owner_rank} for request id {request_id}")
 
 
@@ -204,12 +237,14 @@ class OptimizedLoadManagerClient(LoadManager):
         request_queue,
         task_queue,
         reduce_queue,
+        complete_queue,
         worker: OptimizedLoadWorker,
     ):
         self.rank = rank
         self.request_queue = request_queue
         self.task_queue = task_queue
         self.reduce_queue = reduce_queue
+        self.complete_queue = complete_queue
         self.worker = worker
         self._request_counter = 0
         self._stop_event = threading.Event()
@@ -236,6 +271,12 @@ class OptimizedLoadManagerClient(LoadManager):
             if command.request_id == request_id and command.action == "reduce":
                 self.worker.reduce_from_contributors(command)
                 break
+        self.complete_queue.put(
+            LoadComplete(
+                request_id=request_id,
+                owner_rank=self.rank,
+            )
+        )
         return time.perf_counter() - start_time
 
     def _task_loop(self):
@@ -244,6 +285,7 @@ class OptimizedLoadManagerClient(LoadManager):
             if task is None:
                 break
             if isinstance(task, LoadTask):
+                print(f"Client rank {self.rank}, executing load task for request id {task.request_id}")
                 self.worker.execute_task(task)
 
     def shutdown(self):

@@ -160,6 +160,7 @@ def run_client_optimized(rank, args, queues, host_caches):
         request_queue=queues["request"],
         task_queue=queues["tasks"][rank],
         reduce_queue=queues["reduce"][rank],
+        complete_queue=queues["complete"],
         worker=worker,
     )
     util_ratio = max(0.0, min(1.0, args.pcie_util / 100.0))
@@ -271,10 +272,12 @@ def main():
         request_queue = mp_ctx.Queue()
         task_queues = [mp_ctx.Queue() for _ in range(args.num_clients)]
         reduce_queues = [mp_ctx.Queue() for _ in range(args.num_clients)]
+        complete_queue = mp_ctx.Queue()
         load_manager = OptimizedLoadManager(
             request_queue=request_queue,
             task_queues=task_queues,
             reduce_queues=reduce_queues,
+            complete_queue=complete_queue,
             num_clients=args.num_clients,
         )
         manager_process = mp.Process(target=load_manager.serve, daemon=True)
@@ -283,6 +286,7 @@ def main():
             "request": request_queue,
             "tasks": task_queues,
             "reduce": reduce_queues,
+            "complete": complete_queue,
         }
         mp.spawn(
             run_client_optimized,
@@ -291,6 +295,7 @@ def main():
             join=True,
         )
         request_queue.put(None)
+        complete_queue.put(None)
         manager_process.join(timeout=5)
 
 
