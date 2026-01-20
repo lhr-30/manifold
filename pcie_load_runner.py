@@ -38,6 +38,24 @@ def allocate_cache(num_cpu_blocks, num_gpu_blocks, block_elems, dtype, pin, devi
     gpu_cache = torch.empty((num_gpu_blocks, block_elems), dtype=dtype, device=device)
     return host_cache, gpu_cache
 
+def allocate_shared_host_caches(num_clients, num_cpu_blocks, block_elems, dtype, pin, seed):
+    host_caches = []
+    for rank in range(num_clients):
+        host_cache = torch.empty(
+            (num_cpu_blocks, block_elems),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=pin,
+        ).share_memory_()
+        gen = torch.Generator()
+        gen.manual_seed(seed + rank)
+        if dtype in (torch.int8, torch.uint8, torch.int32):
+            host_cache.random_(0, 127, generator=gen)
+        else:
+            host_cache.uniform_(0, 1, generator=gen)
+        host_caches.append(host_cache)
+    return host_caches
+
 def bind_cpu(rank: int, cores_per_proc: int):
     start = rank * cores_per_proc
     end = start + cores_per_proc
@@ -110,7 +128,7 @@ def run_client_baseline(rank, args):
     )
     print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
 
-def run_client_optimized(rank, args, queues):
+def run_client_optimized(rank, args, queues, host_caches):
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
@@ -124,17 +142,14 @@ def run_client_optimized(rank, args, queues):
     block_bytes = int(args.block_mb * 1e6)
     block_elems = max(1, block_bytes // elem_size)
     block_bytes = block_elems * elem_size
-    host_cache, gpu_cache = allocate_cache(
-        args.num_cpu_blocks,
-        args.num_gpu_blocks,
-        block_elems,
-        dtype,
-        args.pin,
-        device,
-    )
+    host_cache = host_caches[rank]
+    if not host_cache.is_shared():
+        raise SystemExit("Optimized mode requires shared host caches across processes.")
+    gpu_cache = torch.empty((args.num_gpu_blocks, block_elems), dtype=dtype, device=device)
     worker = OptimizedLoadWorker(
         rank=rank,
         host_cache=host_cache,
+        host_caches=host_caches,
         gpu_cache=gpu_cache,
         stream=torch.cuda.Stream(device=device),
         pin=args.pin,
@@ -240,9 +255,22 @@ def main():
         _, port = sock.getsockname()
         sock.close()
         args.dist_init_method = f"tcp://127.0.0.1:{port}"
-        request_queue = mp.Queue()
-        task_queues = [mp.Queue() for _ in range(args.num_clients)]
-        reduce_queues = [mp.Queue() for _ in range(args.num_clients)]
+        dtype = DTYPE_MAP[args.dtype]
+        elem_size = bytes_per_elem(dtype)
+        block_bytes = int(args.block_mb * 1e6)
+        block_elems = max(1, block_bytes // elem_size)
+        host_caches = allocate_shared_host_caches(
+            args.num_clients,
+            args.num_cpu_blocks,
+            block_elems,
+            dtype,
+            args.pin,
+            args.seed,
+        )
+        mp_ctx = mp.get_context("spawn")
+        request_queue = mp_ctx.Queue()
+        task_queues = [mp_ctx.Queue() for _ in range(args.num_clients)]
+        reduce_queues = [mp_ctx.Queue() for _ in range(args.num_clients)]
         load_manager = OptimizedLoadManager(
             request_queue=request_queue,
             task_queues=task_queues,
@@ -256,7 +284,12 @@ def main():
             "tasks": task_queues,
             "reduce": reduce_queues,
         }
-        mp.spawn(run_client_optimized, args=(args, queues), nprocs=args.num_clients, join=True)
+        mp.spawn(
+            run_client_optimized,
+            args=(args, queues, host_caches),
+            nprocs=args.num_clients,
+            join=True,
+        )
         request_queue.put(None)
         manager_process.join(timeout=5)
 

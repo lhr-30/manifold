@@ -78,6 +78,7 @@ class OptimizedLoadManager(LoadManager):
                 request_id=request.request_id,
                 owner_rank=request.owner_rank,
                 worker_rank=rank,
+                host_cache_rank=request.owner_rank,
                 indices_cpu=indices_cpu[start:end],
                 indices_gpu=indices_gpu[start:end],
             )
@@ -85,25 +86,23 @@ class OptimizedLoadManager(LoadManager):
             worker_ranks.append(rank)
         return worker_ranks
 
-@dataclass(frozen=True)
+@dataclass
 class LoadRequest:
     request_id: int
     owner_rank: int
     indices_cpu: Sequence[int]
     indices_gpu: Sequence[int]
 
-
-@dataclass(frozen=True)
+@dataclass
 class LoadTask:
     request_id: int
     owner_rank: int
     worker_rank: int
+    host_cache_rank: int
     indices_cpu: Sequence[int]
     indices_gpu: Sequence[int]
 
-
-@dataclass(frozen=True)
-@dataclass(frozen=True)
+@dataclass
 class ReduceCommand:
     request_id: int
     owner_rank: int
@@ -111,11 +110,11 @@ class ReduceCommand:
     contributors: List[int]
 
 
-@dataclass(frozen=True)
 class OptimizedLoadWorker:
-    def __init__(self, rank, host_cache, gpu_cache, stream, pin, device):
+    def __init__(self, rank, host_cache, host_caches, gpu_cache, stream, pin, device):
         self.rank = rank
         self.host_cache = host_cache
+        self.host_caches = host_caches
         self.gpu_cache = gpu_cache
         self.stream = stream
         self.pin = pin
@@ -131,13 +130,15 @@ class OptimizedLoadWorker:
         indices_cpu = torch.tensor(task.indices_cpu, dtype=torch.int64, device="cpu")
         indices_gpu = torch.tensor(task.indices_gpu, dtype=torch.int64, device=self.device)
         self._task_indices[task.request_id] = indices_gpu
+        host_cache = self.host_caches[task.host_cache_rank]
         with torch.cuda.stream(self.stream):
             self.copy_start.record(self.stream)
-            host_slice = self.host_cache.index_select(0, indices_cpu)
+            host_slice = host_cache.index_select(0, indices_cpu)
             dev_slice = host_slice.to(device=self.device, non_blocking=self.pin)
             self.gpu_cache.index_copy_(0, indices_gpu, dev_slice)
             self.copy_end.record(self.stream)
         self.stream.synchronize()
+        print(f"Worker rank {self.rank}, owner rank {task.owner_rank}, send shards for request id {task.request_id}")
         if task.owner_rank != self.rank:
             self._send_shard(task.request_id, task.owner_rank)
         return self.copy_start.elapsed_time(self.copy_end) / 1e3
@@ -154,6 +155,7 @@ class OptimizedLoadWorker:
                 continue
             size = torch.empty((1,), dtype=torch.int64, device=self.device)
             dist.recv(size, src=rank)
+            print(f"Worker rank {self.rank}, receiving shard from contributor rank {rank} for request id {command.request_id}, size = {size.item()}")
             num_indices = int(size.item())
             if num_indices == 0:
                 continue
@@ -169,6 +171,7 @@ class OptimizedLoadWorker:
         if pending:
             for work in dist.batch_isend_irecv(pending):
                 work.wait()
+            print(f"Worker rank {self.rank}, finished receiving shards for request id {command.request_id}")
             for indices, data in pending_meta:
                 self.gpu_cache.index_copy_(0, indices, data)
 
@@ -191,6 +194,7 @@ class OptimizedLoadWorker:
         ]
         for work in dist.batch_isend_irecv(ops):
             work.wait()
+        print(f"Finish sending: Worker rank {self.rank}, sent shard to owner rank {owner_rank} for request id {request_id}")
 
 
 class OptimizedLoadManagerClient(LoadManager):
@@ -214,8 +218,9 @@ class OptimizedLoadManagerClient(LoadManager):
 
     def load(self, indices_cpu, indices_gpu, device_id):
         _ = device_id
-        request_id = (self.rank << 32) | self._request_counter
+        request_id = self._request_counter + 100000 * self.rank
         self._request_counter += 1
+        print(f"Client rank {self.rank}, submitting load request id {request_id}")
         request = LoadRequest(
             request_id=request_id,
             owner_rank=self.rank,
