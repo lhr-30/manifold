@@ -57,6 +57,7 @@ class OptimizedLoadManager(LoadManager):
         while True:
             request = self.request_queue.get()
             if request is None:
+                print("Manager received shutdown signal.")
                 break
             print(f"Manager received load request id {request.request_id} from owner rank {request.owner_rank}")
             worker_ranks = self._dispatch_tasks(request)
@@ -77,6 +78,7 @@ class OptimizedLoadManager(LoadManager):
                     and completion.owner_rank == request.owner_rank
                 ):
                     break
+            print(f"[Manager] completed load request id {request.request_id} from owner rank {request.owner_rank}")
 
     def _dispatch_tasks(self, request):
         indices_cpu = list(request.indices_cpu)
@@ -126,6 +128,9 @@ class LoadComplete:
     request_id: int
     owner_rank: int
 
+from contextlib import contextmanager
+
+
 class OptimizedLoadWorker:
     def __init__(self, rank, host_cache, host_caches, gpu_cache, stream, pin, device):
         self.rank = rank
@@ -139,6 +144,21 @@ class OptimizedLoadWorker:
         self.copy_end = torch.cuda.Event(enable_timing=True)
         self._task_indices: Dict[int, torch.Tensor] = {}
         self._dist_lock = threading.Lock()
+
+    @contextmanager
+    def dist_lock(self, op: str, req: int, peer: int = -1):
+        tid = threading.current_thread().name
+        t0 = time.perf_counter()
+        print(f"[R{self.rank}][{tid}] ACQUIRE_WAIT op={op} req={req} peer={peer}")
+        self._dist_lock.acquire()
+        t1 = time.perf_counter()
+        print(f"[R{self.rank}][{tid}] ACQUIRE_OK   op={op} req={req} peer={peer} wait_ms={(t1-t0)*1e3:.3f}")
+        try:
+            yield
+        finally:
+            t2 = time.perf_counter()
+            self._dist_lock.release()
+            print(f"[R{self.rank}][{tid}] RELEASE     op={op} req={req} peer={peer} hold_ms={(t2-t1)*1e3:.3f}")
 
     def execute_task(self, task: LoadTask):
         if not task.indices_cpu:
@@ -155,8 +175,8 @@ class OptimizedLoadWorker:
             self.gpu_cache.index_copy_(0, indices_gpu, dev_slice)
             self.copy_end.record(self.stream)
         self.stream.synchronize()
-        print(f"Worker rank {self.rank}, owner rank {task.owner_rank}, send shards for request id {task.request_id}")
         if task.owner_rank != self.rank:
+            print(f"Worker rank {self.rank}, owner rank {task.owner_rank}, send shards for request id {task.request_id}")
             self._send_shard(task.request_id, task.owner_rank)
         return self.copy_start.elapsed_time(self.copy_end) / 1e3
 
@@ -177,7 +197,8 @@ class OptimizedLoadWorker:
                 f"Worker rank {self.rank}, preparing to receive shard from contributor rank {rank} "
                 f"for request id {command.request_id}"
             )
-            with self._dist_lock:
+            # with self._dist_lock:
+            with self.dist_lock("recv_size", req=command.request_id, peer=rank):
                 size = torch.empty((1,), dtype=torch.int64, device=self.device)
                 dist.recv(size, src=rank)
             print(
@@ -193,11 +214,12 @@ class OptimizedLoadWorker:
                 dtype=self.gpu_cache.dtype,
                 device=self.device,
             )
-            pending.append(dist.P2POp(dist.irecv, indices, src=rank))
-            pending.append(dist.P2POp(dist.irecv, data, src=rank))
+            pending.append(dist.P2POp(dist.irecv, indices, peer=rank))
+            pending.append(dist.P2POp(dist.irecv, data, peer=rank))
             pending_meta.append((indices, data))
         if pending:
-            with self._dist_lock:
+            # with self._dist_lock:
+            with self.dist_lock("recv_payload", req=command.request_id, peer=-1):
                 for work in dist.batch_isend_irecv(pending):
                     work.wait()
             print(f"Worker rank {self.rank}, finished receiving shards for request id {command.request_id}")
@@ -208,23 +230,27 @@ class OptimizedLoadWorker:
         torch.cuda.set_device(self.device)
         indices = self._task_indices.pop(request_id, None)
         if indices is None:
-            with self._dist_lock:
+            print("!!!!!")
+            # with self._dist_lock:
+            with self.dist_lock("send_size", req=request_id, peer=owner_rank):
                 size = torch.zeros((1,), dtype=torch.int64, device=self.device)
                 dist.send(size, dst=owner_rank)
             return
         num_indices = int(indices.numel())
         print(f"Worker rank {self.rank}, sending shard to owner rank {owner_rank} for request id {request_id}, num indices = {num_indices}")
-        with self._dist_lock:
+        # with self._dist_lock:
+        with self.dist_lock("send_size", req=request_id, peer=owner_rank):
             size = torch.tensor([num_indices], dtype=torch.int64, device=self.device)
             dist.send(size, dst=owner_rank)
         if num_indices == 0:
             return
         data = self.gpu_cache.index_select(0, indices)
         ops = [
-            dist.P2POp(dist.isend, indices, dst=owner_rank),
-            dist.P2POp(dist.isend, data, dst=owner_rank),
+            dist.P2POp(dist.isend, indices, peer=owner_rank),
+            dist.P2POp(dist.isend, data, peer=owner_rank),
         ]
-        with self._dist_lock:
+        # with self._dist_lock:
+        with self.dist_lock("send_payload", req=request_id, peer=owner_rank):
             for work in dist.batch_isend_irecv(ops):
                 work.wait()
         print(f"Finish sending: Worker rank {self.rank}, sent shard to owner rank {owner_rank} for request id {request_id}")
@@ -269,6 +295,7 @@ class OptimizedLoadManagerClient(LoadManager):
             if command is None:
                 break
             if command.request_id == request_id and command.action == "reduce":
+                print(f"Client rank {self.rank}, processing reduce command for request id {request_id}")
                 self.worker.reduce_from_contributors(command)
                 break
         self.complete_queue.put(
@@ -289,6 +316,7 @@ class OptimizedLoadManagerClient(LoadManager):
                 self.worker.execute_task(task)
 
     def shutdown(self):
+        print(f"[Client] rank {self.rank} shutting down.")
         self._stop_event.set()
         self.task_queue.put(None)
         self._task_thread.join(timeout=5)

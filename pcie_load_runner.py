@@ -201,6 +201,8 @@ def run_client_optimized(rank, args, queues, host_caches):
         f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
     )
     print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
+    dist.barrier(device_ids=[rank])
+    print("Rank {rank} shutting down load manager...")
     load_manager.shutdown()
     dist.destroy_process_group()
 
@@ -212,8 +214,8 @@ def main():
     ap.add_argument("--block-mb", type=float, default=16.0, help="Block size (MB) for each KV cache block.")
     ap.add_argument("--read-min-blocks", type=int, default=32)
     ap.add_argument("--read-max-blocks", type=int, default=32)
-    ap.add_argument("--iters", type=int, default=50)
-    ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--iters", type=int, default=3)
+    ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--pcie-util", type=float, default=70.0, help="Target PCIe utilization (0-100%).")
     ap.add_argument("--sleep-min-ms", type=float, default=5.0, help="Random compute sleep min (ms).")
     ap.add_argument("--sleep-max-ms", type=float, default=5.0, help="Random compute sleep max (ms).")
@@ -294,8 +296,9 @@ def main():
             nprocs=args.num_clients,
             join=True,
         )
+        
+        print("Shutting down load manager...")
         request_queue.put(None)
-        complete_queue.put(None)
         manager_process.join(timeout=5)
 
 
