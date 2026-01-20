@@ -6,7 +6,12 @@ import torch.multiprocessing as mp
 import os
 
 from pcie_load_client import PcieLoadClient, PcieLoadProcess
-from kvcache_pcie_sim import BaselineLoadManager, OptimizedLoadManager
+from kvcache_pcie_sim import (
+    BaselineLoadManager,
+    OptimizedLoadManager,
+    OptimizedLoadManagerClient,
+    OptimizedLoadWorker,
+)
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -102,12 +107,39 @@ def run_client_baseline(rank, args):
     )
     print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
 
-def run_client_optimized(rank, args, load_manager):
+def run_client_optimized(rank, args, queues):
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
+    dtype = DTYPE_MAP[args.dtype]
+    elem_size = bytes_per_elem(dtype)
+    block_bytes = int(args.block_mb * 1e6)
+    block_elems = max(1, block_bytes // elem_size)
+    block_bytes = block_elems * elem_size
+    host_cache, gpu_cache = allocate_cache(
+        args.num_cpu_blocks,
+        args.num_gpu_blocks,
+        block_elems,
+        dtype,
+        args.pin,
+        device,
+    )
+    worker = OptimizedLoadWorker(
+        host_cache=host_cache,
+        gpu_cache=gpu_cache,
+        stream=torch.cuda.Stream(device=device),
+        pin=args.pin,
+        device=device,
+    )
+    load_manager = OptimizedLoadManagerClient(
+        rank=rank,
+        request_queue=queues["request"],
+        task_queue=queues["tasks"][rank],
+        completion_queue=queues["completion"],
+        reduce_queue=queues["reduce"][rank],
+        worker=worker,
+    )
     util_ratio = max(0.0, min(1.0, args.pcie_util / 100.0))
     rng = random.Random(args.seed + rank) if args.randomize else None
-    block_bytes = int(args.block_mb * 1e6)
     process = PcieLoadProcess(
         None,
         load_manager,
@@ -144,6 +176,7 @@ def run_client_optimized(rank, args, load_manager):
         f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
     )
     print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
+    load_manager.shutdown()
 
 def main():
     ap = argparse.ArgumentParser()
@@ -192,36 +225,28 @@ def main():
         # mp.spawn(run_client_baseline, args=(args, ), nprocs=args.num_clients, join=True)
         run_client_baseline(0, args)
     else:
-        dtype = DTYPE_MAP[args.dtype]
-        elem_size = bytes_per_elem(dtype)
-        block_bytes = int(args.block_mb * 1e6)
-        block_elems = max(1, block_bytes // elem_size)
-        block_bytes = block_elems * elem_size
-        devices = [torch.device(f"cuda:{idx}") for idx in range(args.num_clients)]
-        host_caches = []
-        gpu_caches = []
-        for idx in range(args.num_clients):
-            host_cache, gpu_cache = allocate_cache(
-                args.num_cpu_blocks,
-                args.num_gpu_blocks,
-                block_elems,
-                dtype,
-                args.pin,
-                devices[idx],
-            )
-            host_caches.append(host_cache)
-            gpu_caches.append(gpu_cache)
-        streams = [torch.cuda.Stream(device=devices[i]) for i in range(args.num_clients)]
-        print("Caches allocated.")
+        request_queue = mp.Queue()
+        completion_queue = mp.Queue()
+        task_queues = [mp.Queue() for _ in range(args.num_clients)]
+        reduce_queues = [mp.Queue() for _ in range(args.num_clients)]
         load_manager = OptimizedLoadManager(
-            host_caches=host_caches,
-            block_elems=block_elems,
-            pin=args.pin,
-            devices=devices,
-            streams=streams,
-            gpu_caches=gpu_caches,
+            request_queue=request_queue,
+            task_queues=task_queues,
+            completion_queue=completion_queue,
+            reduce_queues=reduce_queues,
+            num_clients=args.num_clients,
         )
-        mp.spawn(run_client_optimized, args=(args, load_manager), nprocs=args.num_clients, join=True)
+        manager_process = mp.Process(target=load_manager.serve, daemon=True)
+        manager_process.start()
+        queues = {
+            "request": request_queue,
+            "completion": completion_queue,
+            "tasks": task_queues,
+            "reduce": reduce_queues,
+        }
+        mp.spawn(run_client_optimized, args=(args, queues), nprocs=args.num_clients, join=True)
+        request_queue.put(None)
+        manager_process.join(timeout=5)
 
 
 if __name__ == "__main__":
