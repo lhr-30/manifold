@@ -244,13 +244,22 @@ class OptimizedLoadWorker:
             with self.dist_lock("recv_size", req=command.request_id, peer=rank):
                 size = torch.empty((1,), dtype=torch.int64, device=self.device)
                 dist.recv(size, src=rank)
-            logger.info(
-                "Worker rank %s, receiving shard from contributor rank %s for request id %s, size = %s",
-                self.rank,
-                rank,
-                command.request_id,
-                size.item(),
-            )
+            # logger.info("[R%s] after dist.recv(size) req=%s from=%s (before size.item())",
+            #     self.rank, 
+            #     command.request_id, 
+            #     rank
+            # )
+            # logger.info(
+            #     "Worker rank %s, receiving shard from contributor rank %s for request id %s, size = %s",
+            #     self.rank,
+            #     rank,
+            #     command.request_id,
+            #     size.item(),
+            # )
+            logger.info("[R%s] before cuda sync for header req=%s from=%s", self.rank, command.request_id, rank)
+            torch.cuda.synchronize(self.device)
+            logger.info("[R%s] after cuda sync for header req=%s from=%s", self.rank, command.request_id, rank)
+
             num_indices = int(size.item())
             if num_indices == 0:
                 continue

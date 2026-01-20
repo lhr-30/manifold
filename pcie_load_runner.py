@@ -154,6 +154,11 @@ def run_client_optimized(rank, args, queues, host_caches):
         world_size=args.num_clients,
         rank=rank,
     )
+    pid = os.getpid()
+    ppid = os.getppid()
+    host = socket.gethostname()
+    logger.info("[BOOT] rank=%s pid=%s ppid=%s host=%s", rank, pid, ppid, host)
+    logger.info("[BOOT] rank=%s dist initialized (pid=%s)", rank, pid)
     dtype = DTYPE_MAP[args.dtype]
     elem_size = bytes_per_elem(dtype)
     block_bytes = int(args.block_mb * 1e6)
