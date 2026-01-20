@@ -3,9 +3,10 @@
 from dataclasses import dataclass
 import threading
 import time
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 import torch
+import torch.distributed as dist
 
 class LoadManager:
     def load(self, indices_cpu, indices_gpu, device_id):  # pragma: no cover - interface
@@ -42,13 +43,11 @@ class OptimizedLoadManager(LoadManager):
         self,
         request_queue,
         task_queues,
-        completion_queue,
         reduce_queues,
         num_clients,
     ):
         self.request_queue = request_queue
         self.task_queues = task_queues
-        self.completion_queue = completion_queue
         self.reduce_queues = reduce_queues
         self.num_clients = num_clients
 
@@ -58,7 +57,6 @@ class OptimizedLoadManager(LoadManager):
             if request is None:
                 break
             worker_ranks = self._dispatch_tasks(request)
-            self._wait_for_completion(request.request_id, worker_ranks)
             self.reduce_queues[request.owner_rank].put(
                 ReduceCommand(
                     request_id=request.request_id,
@@ -67,16 +65,6 @@ class OptimizedLoadManager(LoadManager):
                     contributors=worker_ranks,
                 )
             )
-            for rank in worker_ranks:
-                if rank == request.owner_rank:
-                    continue
-                self.task_queues[rank].put(
-                    ControlCommand(
-                        request_id=request.request_id,
-                        owner_rank=request.owner_rank,
-                        action="copy",
-                    )
-                )
 
     def _dispatch_tasks(self, request):
         indices_cpu = list(request.indices_cpu)
@@ -97,15 +85,6 @@ class OptimizedLoadManager(LoadManager):
             worker_ranks.append(rank)
         return worker_ranks
 
-    def _wait_for_completion(self, request_id, worker_ranks):
-        pending = set(worker_ranks)
-        while pending:
-            completion = self.completion_queue.get()
-            if completion.request_id != request_id:
-                continue
-            pending.discard(completion.worker_rank)
-
-
 @dataclass(frozen=True)
 class LoadRequest:
     request_id: int
@@ -124,11 +103,6 @@ class LoadTask:
 
 
 @dataclass(frozen=True)
-class TaskCompletion:
-    request_id: int
-    worker_rank: int
-
-
 @dataclass(frozen=True)
 class ReduceCommand:
     request_id: int
@@ -138,14 +112,9 @@ class ReduceCommand:
 
 
 @dataclass(frozen=True)
-class ControlCommand:
-    request_id: int
-    owner_rank: int
-    action: str
-
-
 class OptimizedLoadWorker:
-    def __init__(self, host_cache, gpu_cache, stream, pin, device):
+    def __init__(self, rank, host_cache, gpu_cache, stream, pin, device):
+        self.rank = rank
         self.host_cache = host_cache
         self.gpu_cache = gpu_cache
         self.stream = stream
@@ -153,6 +122,7 @@ class OptimizedLoadWorker:
         self.device = device
         self.copy_start = torch.cuda.Event(enable_timing=True)
         self.copy_end = torch.cuda.Event(enable_timing=True)
+        self._task_indices: Dict[int, torch.Tensor] = {}
 
     def execute_task(self, task: LoadTask):
         if not task.indices_cpu:
@@ -160,6 +130,7 @@ class OptimizedLoadWorker:
         torch.cuda.set_device(self.device)
         indices_cpu = torch.tensor(task.indices_cpu, dtype=torch.int64, device="cpu")
         indices_gpu = torch.tensor(task.indices_gpu, dtype=torch.int64, device=self.device)
+        self._task_indices[task.request_id] = indices_gpu
         with torch.cuda.stream(self.stream):
             self.copy_start.record(self.stream)
             host_slice = self.host_cache.index_select(0, indices_cpu)
@@ -167,10 +138,59 @@ class OptimizedLoadWorker:
             self.gpu_cache.index_copy_(0, indices_gpu, dev_slice)
             self.copy_end.record(self.stream)
         self.stream.synchronize()
+        if task.owner_rank != self.rank:
+            self._send_shard(task.request_id, task.owner_rank)
         return self.copy_start.elapsed_time(self.copy_end) / 1e3
 
-    def handle_control(self, command: ControlCommand):
-        _ = command
+    def reduce_from_contributors(self, command: ReduceCommand):
+        torch.cuda.set_device(self.device)
+        self._task_indices.pop(command.request_id, None)
+        if not command.contributors:
+            return
+        pending = []
+        pending_meta = []
+        for rank in command.contributors:
+            if rank == command.owner_rank:
+                continue
+            size = torch.empty((1,), dtype=torch.int64, device=self.device)
+            dist.recv(size, src=rank)
+            num_indices = int(size.item())
+            if num_indices == 0:
+                continue
+            indices = torch.empty((num_indices,), dtype=torch.int64, device=self.device)
+            data = torch.empty(
+                (num_indices, self.gpu_cache.shape[1]),
+                dtype=self.gpu_cache.dtype,
+                device=self.device,
+            )
+            pending.append(dist.P2POp(dist.irecv, indices, src=rank))
+            pending.append(dist.P2POp(dist.irecv, data, src=rank))
+            pending_meta.append((indices, data))
+        if pending:
+            for work in dist.batch_isend_irecv(pending):
+                work.wait()
+            for indices, data in pending_meta:
+                self.gpu_cache.index_copy_(0, indices, data)
+
+    def _send_shard(self, request_id: int, owner_rank: int):
+        torch.cuda.set_device(self.device)
+        indices = self._task_indices.pop(request_id, None)
+        if indices is None:
+            size = torch.zeros((1,), dtype=torch.int64, device=self.device)
+            dist.send(size, dst=owner_rank)
+            return
+        num_indices = int(indices.numel())
+        size = torch.tensor([num_indices], dtype=torch.int64, device=self.device)
+        dist.send(size, dst=owner_rank)
+        if num_indices == 0:
+            return
+        data = self.gpu_cache.index_select(0, indices)
+        ops = [
+            dist.P2POp(dist.isend, indices, dst=owner_rank),
+            dist.P2POp(dist.isend, data, dst=owner_rank),
+        ]
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
 
 
 class OptimizedLoadManagerClient(LoadManager):
@@ -179,14 +199,12 @@ class OptimizedLoadManagerClient(LoadManager):
         rank,
         request_queue,
         task_queue,
-        completion_queue,
         reduce_queue,
         worker: OptimizedLoadWorker,
     ):
         self.rank = rank
         self.request_queue = request_queue
         self.task_queue = task_queue
-        self.completion_queue = completion_queue
         self.reduce_queue = reduce_queue
         self.worker = worker
         self._request_counter = 0
@@ -211,6 +229,7 @@ class OptimizedLoadManagerClient(LoadManager):
             if command is None:
                 break
             if command.request_id == request_id and command.action == "reduce":
+                self.worker.reduce_from_contributors(command)
                 break
         return time.perf_counter() - start_time
 
@@ -221,11 +240,6 @@ class OptimizedLoadManagerClient(LoadManager):
                 break
             if isinstance(task, LoadTask):
                 self.worker.execute_task(task)
-                self.completion_queue.put(
-                    TaskCompletion(request_id=task.request_id, worker_rank=self.rank)
-                )
-            elif isinstance(task, ControlCommand):
-                self.worker.handle_control(task)
 
     def shutdown(self):
         self._stop_event.set()

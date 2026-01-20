@@ -1,9 +1,12 @@
 import argparse
-import random
-import statistics as stats
-import torch
-import torch.multiprocessing as mp
 import os
+import random
+import socket
+import statistics as stats
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from pcie_load_client import PcieLoadClient, PcieLoadProcess
 from kvcache_pcie_sim import (
@@ -110,6 +113,12 @@ def run_client_baseline(rank, args):
 def run_client_optimized(rank, args, queues):
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        backend="nccl",
+        init_method=args.dist_init_method,
+        world_size=args.num_clients,
+        rank=rank,
+    )
     dtype = DTYPE_MAP[args.dtype]
     elem_size = bytes_per_elem(dtype)
     block_bytes = int(args.block_mb * 1e6)
@@ -124,6 +133,7 @@ def run_client_optimized(rank, args, queues):
         device,
     )
     worker = OptimizedLoadWorker(
+        rank=rank,
         host_cache=host_cache,
         gpu_cache=gpu_cache,
         stream=torch.cuda.Stream(device=device),
@@ -134,7 +144,6 @@ def run_client_optimized(rank, args, queues):
         rank=rank,
         request_queue=queues["request"],
         task_queue=queues["tasks"][rank],
-        completion_queue=queues["completion"],
         reduce_queue=queues["reduce"][rank],
         worker=worker,
     )
@@ -177,6 +186,7 @@ def run_client_optimized(rank, args, queues):
     )
     print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
     load_manager.shutdown()
+    dist.destroy_process_group()
 
 def main():
     ap = argparse.ArgumentParser()
@@ -225,14 +235,17 @@ def main():
         # mp.spawn(run_client_baseline, args=(args, ), nprocs=args.num_clients, join=True)
         run_client_baseline(0, args)
     else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        _, port = sock.getsockname()
+        sock.close()
+        args.dist_init_method = f"tcp://127.0.0.1:{port}"
         request_queue = mp.Queue()
-        completion_queue = mp.Queue()
         task_queues = [mp.Queue() for _ in range(args.num_clients)]
         reduce_queues = [mp.Queue() for _ in range(args.num_clients)]
         load_manager = OptimizedLoadManager(
             request_queue=request_queue,
             task_queues=task_queues,
-            completion_queue=completion_queue,
             reduce_queues=reduce_queues,
             num_clients=args.num_clients,
         )
@@ -240,7 +253,6 @@ def main():
         manager_process.start()
         queues = {
             "request": request_queue,
-            "completion": completion_queue,
             "tasks": task_queues,
             "reduce": reduce_queues,
         }
