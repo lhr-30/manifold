@@ -3,6 +3,7 @@ import random
 import statistics as stats
 import torch
 import torch.multiprocessing as mp
+import os
 
 from pcie_load_client import PcieLoadClient, PcieLoadProcess
 from kvcache_pcie_sim import BaselineLoadManager, OptimizedLoadManager
@@ -29,12 +30,35 @@ def allocate_cache(num_cpu_blocks, num_gpu_blocks, block_elems, dtype, pin, devi
     gpu_cache = torch.empty((num_gpu_blocks, block_elems), dtype=dtype, device=device)
     return host_cache, gpu_cache
 
+def bind_cpu(rank: int, cores_per_proc: int):
+    start = rank * cores_per_proc
+    end = start + cores_per_proc
+    core_ids = list(range(start, end))
 
-def run_client_baseline(rank, args, host_caches, gpu_caches):
+    os.sched_setaffinity(0, core_ids)  # pid=0 means current process
+    
+    # os.environ["OMP_NUM_THREADS"] = str(cores_per_proc)
+    # os.environ["MKL_NUM_THREADS"] = str(cores_per_proc)
+    # torch.set_num_threads(cores_per_proc)
+    # torch.set_num_interop_threads(1)
+
+def run_client_baseline(rank, args):
+    bind_cpu(rank, args.cores_per_proc)
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
-    host_cache = host_caches[rank]
-    gpu_cache = gpu_caches[rank]
+    dtype = DTYPE_MAP[args.dtype]
+    elem_size = bytes_per_elem(dtype)
+    block_bytes = int(args.block_mb * 1e6)
+    block_elems = max(1, block_bytes // elem_size)
+    block_bytes = block_elems * elem_size
+    host_cache, gpu_cache = allocate_cache(
+            args.num_cpu_blocks,
+            args.num_gpu_blocks,
+            block_elems,
+            dtype,
+            args.pin,
+            device,
+        )
     load_manager = BaselineLoadManager(host_cache, gpu_cache, torch.cuda.Stream(device=device), args.pin, device)
     util_ratio = max(0.0, min(1.0, args.pcie_util / 100.0))
     rng = random.Random(args.seed + rank) if args.randomize else None
@@ -70,9 +94,11 @@ def run_client_baseline(rank, args, host_caches, gpu_caches):
     stats_tensor = torch.tensor(
         [stats.mean(per_iter_gbps), stats.median(per_iter_gbps)], dtype=torch.float64, device=device
     )
+    print()
     print(
         f"Rank{rank} PCIe H2D bandwidth (GB/s): "
-        f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
+        f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}",
+        f"affinity = {sorted(os.sched_getaffinity(0))}"
     )
     print("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
 
@@ -124,7 +150,7 @@ def main():
     ap.add_argument("--mode", choices=["baseline", "optimized"], default="baseline")
     ap.add_argument("--num-gpu-blocks", type=int, default=256, help="Number of blocks in the KV cache per GPU.")
     ap.add_argument("--num-cpu-blocks", type=int, default=512, help="Number of blocks in the KV cache on CPU.")
-    ap.add_argument("--block-mb", type=float, default=8.0, help="Block size (MB) for each KV cache block.")
+    ap.add_argument("--block-mb", type=float, default=16.0, help="Block size (MB) for each KV cache block.")
     ap.add_argument("--read-min-blocks", type=int, default=32)
     ap.add_argument("--read-max-blocks", type=int, default=32)
     ap.add_argument("--iters", type=int, default=50)
@@ -136,6 +162,7 @@ def main():
     ap.add_argument("--dtype", type=str, default="float16", choices=DTYPE_MAP.keys())
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--randomize", action="store_true", help="Enable randomized block sizes and sleep jitter.")
+    ap.add_argument("--cores-per-proc", type=int, help="set CPU cores per process for binding.", default=6)
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -161,31 +188,31 @@ def main():
     print(f"Sleep jitter: {args.sleep_min_ms:.2f}~{args.sleep_max_ms:.2f} ms")
     print()
 
-    dtype = DTYPE_MAP[args.dtype]
-    elem_size = bytes_per_elem(dtype)
-    block_bytes = int(args.block_mb * 1e6)
-    block_elems = max(1, block_bytes // elem_size)
-    block_bytes = block_elems * elem_size
-    devices = [torch.device(f"cuda:{idx}") for idx in range(args.num_clients)]
-    host_caches = []
-    gpu_caches = []
-    for idx in range(args.num_clients):
-        host_cache, gpu_cache = allocate_cache(
-            args.num_cpu_blocks,
-            args.num_gpu_blocks,
-            block_elems,
-            dtype,
-            args.pin,
-            devices[idx],
-        )
-        host_caches.append(host_cache)
-        gpu_caches.append(gpu_cache)
-    streams = [torch.cuda.Stream(device=devices[i]) for i in range(args.num_clients)]
-    print("Caches allocated.")
     if args.mode == "baseline":
-        # mp.spawn(run_client_baseline, args=(args, host_caches, gpu_caches), nprocs=args.num_clients, join=True)
-        run_client_baseline(0, args, host_caches, gpu_caches)
+        # mp.spawn(run_client_baseline, args=(args, ), nprocs=args.num_clients, join=True)
+        run_client_baseline(0, args)
     else:
+        dtype = DTYPE_MAP[args.dtype]
+        elem_size = bytes_per_elem(dtype)
+        block_bytes = int(args.block_mb * 1e6)
+        block_elems = max(1, block_bytes // elem_size)
+        block_bytes = block_elems * elem_size
+        devices = [torch.device(f"cuda:{idx}") for idx in range(args.num_clients)]
+        host_caches = []
+        gpu_caches = []
+        for idx in range(args.num_clients):
+            host_cache, gpu_cache = allocate_cache(
+                args.num_cpu_blocks,
+                args.num_gpu_blocks,
+                block_elems,
+                dtype,
+                args.pin,
+                devices[idx],
+            )
+            host_caches.append(host_cache)
+            gpu_caches.append(gpu_cache)
+        streams = [torch.cuda.Stream(device=devices[i]) for i in range(args.num_clients)]
+        print("Caches allocated.")
         load_manager = OptimizedLoadManager(
             host_caches=host_caches,
             block_elems=block_elems,
