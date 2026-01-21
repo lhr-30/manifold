@@ -223,9 +223,8 @@ def run_client_optimized(rank, args, queues, host_caches):
         f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
     )
     logger.info("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
-    dist.barrier()
     logger.info("Rank %s shutting down load manager...", rank)
-    load_manager.shutdown()
+    load_manager.wait_for_shutdown()
     dist.destroy_process_group()
 
 def run_manager_process(load_manager, log_file: str) -> None:
@@ -310,12 +309,14 @@ def main():
         task_queues = [mp_ctx.Queue() for _ in range(args.num_clients)]
         reduce_queues = [mp_ctx.Queue() for _ in range(args.num_clients)]
         complete_queue = mp_ctx.Queue()
+        total_requests = args.num_clients * (args.warmup + args.iters)
         load_manager = OptimizedLoadManager(
             request_queue=request_queue,
             task_queues=task_queues,
             reduce_queues=reduce_queues,
             complete_queue=complete_queue,
             num_clients=args.num_clients,
+            num_requests=total_requests,
         )
         manager_process = mp.Process(
             target=run_manager_process,
@@ -335,7 +336,7 @@ def main():
             nprocs=args.num_clients,
             join=True,
         )
-        
+
         logger.info("Shutting down load manager...")
         request_queue.put(None)
         manager_process.join(timeout=5)
