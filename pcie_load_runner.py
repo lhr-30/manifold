@@ -223,7 +223,7 @@ def run_client_optimized(rank, args, queues, host_caches):
         f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
     )
     logger.info("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
-    dist.barrier(device_ids=[rank])
+    dist.barrier()
     logger.info("Rank %s shutting down load manager...", rank)
     load_manager.shutdown()
     dist.destroy_process_group()

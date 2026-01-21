@@ -161,6 +161,9 @@ class OptimizedLoadWorker:
         self.copy_end = torch.cuda.Event(enable_timing=True)
         self._task_indices: Dict[int, torch.Tensor] = {}
         self._dist_lock = threading.Lock()
+        self._cpu_group = None
+        if dist.is_initialized():
+            self._cpu_group = dist.new_group(backend="gloo")
 
     @contextmanager
     def dist_lock(self, op: str, req: int, peer: int = -1):
@@ -242,23 +245,15 @@ class OptimizedLoadWorker:
             )
             # with self._dist_lock:
             with self.dist_lock("recv_size", req=command.request_id, peer=rank):
-                size = torch.empty((1,), dtype=torch.int64, device=self.device)
-                dist.recv(size, src=rank)
-            # logger.info("[R%s] after dist.recv(size) req=%s from=%s (before size.item())",
-            #     self.rank, 
-            #     command.request_id, 
-            #     rank
-            # )
-            # logger.info(
-            #     "Worker rank %s, receiving shard from contributor rank %s for request id %s, size = %s",
-            #     self.rank,
-            #     rank,
-            #     command.request_id,
-            #     size.item(),
-            # )
-            logger.info("[R%s] before cuda sync for header req=%s from=%s", self.rank, command.request_id, rank)
-            torch.cuda.synchronize(self.device)
-            logger.info("[R%s] after cuda sync for header req=%s from=%s", self.rank, command.request_id, rank)
+                size = torch.empty((1,), dtype=torch.int64, device="cpu")
+                dist.recv(size, src=rank, group=self._cpu_group)
+            logger.info(
+                "Worker rank %s, receiving shard from contributor rank %s for request id %s, size = %s",
+                self.rank,
+                rank,
+                command.request_id,
+                size.item(),
+            )
 
             num_indices = int(size.item())
             if num_indices == 0:
@@ -292,8 +287,8 @@ class OptimizedLoadWorker:
             logger.warning("!!!!!")
             # with self._dist_lock:
             with self.dist_lock("send_size", req=request_id, peer=owner_rank):
-                size = torch.zeros((1,), dtype=torch.int64, device=self.device)
-                dist.send(size, dst=owner_rank)
+                size = torch.zeros((1,), dtype=torch.int64, device="cpu")
+                dist.send(size, dst=owner_rank, group=self._cpu_group)
             return
         num_indices = int(indices.numel())
         logger.info(
@@ -305,8 +300,8 @@ class OptimizedLoadWorker:
         )
         # with self._dist_lock:
         with self.dist_lock("send_size", req=request_id, peer=owner_rank):
-            size = torch.tensor([num_indices], dtype=torch.int64, device=self.device)
-            dist.send(size, dst=owner_rank)
+            size = torch.tensor([num_indices], dtype=torch.int64, device="cpu")
+            dist.send(size, dst=owner_rank, group=self._cpu_group)
         if num_indices == 0:
             return
         data = self.gpu_cache.index_select(0, indices)
