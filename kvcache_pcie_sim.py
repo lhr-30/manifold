@@ -55,12 +55,15 @@ class OptimizedLoadManager(LoadManager):
         reduce_queues,
         complete_queue,
         num_clients,
+        num_requests,
     ):
         self.request_queue = request_queue
         self.task_queues = task_queues
         self.reduce_queues = reduce_queues
         self.complete_queue = complete_queue
         self.num_clients = num_clients
+        self.num_requests = num_requests
+        self.counter = 0
 
     def serve(self):
         while True:
@@ -96,6 +99,13 @@ class OptimizedLoadManager(LoadManager):
                 request.request_id,
                 request.owner_rank,
             )
+            self.counter += 1
+            if self.counter >= self.num_requests:
+                logger.info("Manager processed all requests, shutting down.")
+                for i in range(self.num_clients):
+                    self.reduce_queues[i].put(None)
+                    self.task_queues[i].put(None)
+                break
 
     def _dispatch_tasks(self, request):
         indices_cpu = list(request.indices_cpu)
@@ -393,6 +403,18 @@ class OptimizedLoadManagerClient(LoadManager):
         self._stop_event.set()
         self.task_queue.put(None)
         self._task_thread.join(timeout=5)
+
+    def wait_for_shutdown(self):
+        while True:
+            command = self.reduce_queue.get()
+            if command is None:
+                break
+            logger.info(
+                "Client rank %s, skipping unexpected command while waiting for shutdown: %s",
+                self.rank,
+                command,
+            )
+        self.shutdown()
 
 
 def _split_indices(total_blocks: int, num_clients: int):
