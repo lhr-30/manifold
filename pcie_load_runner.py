@@ -138,8 +138,8 @@ def run_client_baseline(rank, args):
     logger.info("")
     logger.info(
         f"Rank{rank} PCIe H2D bandwidth (GB/s): "
-        f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}",
-        f"affinity = {sorted(os.sched_getaffinity(0))}"
+        f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}; "
+        f"affinity={sorted(os.sched_getaffinity(0))}"
     )
     logger.info("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
 
@@ -214,15 +214,16 @@ def run_client_optimized(rank, args, queues, host_caches):
     )
     process.client = client
 
-    per_iter_gbps = client.run()
-    stats_tensor = torch.tensor(
-        [stats.mean(per_iter_gbps), stats.median(per_iter_gbps)], dtype=torch.float64, device=device
-    )
-    logger.info(
-        f"Rank{rank} PCIe H2D bandwidth (GB/s): "
-        f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
-    )
-    logger.info("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
+    if rank == 0:
+        per_iter_gbps = client.run()
+        stats_tensor = torch.tensor(
+            [stats.mean(per_iter_gbps), stats.median(per_iter_gbps)], dtype=torch.float64, device=device
+        )
+        logger.info(
+            f"Rank{rank} PCIe H2D bandwidth (GB/s): "
+            f"avg {stats_tensor[0].item():.2f}, p50 {stats_tensor[1].item():.2f}"
+        )
+        logger.info("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
     logger.info("Rank %s shutting down load manager...", rank)
     load_manager.wait_for_shutdown()
     dist.destroy_process_group()
@@ -309,7 +310,8 @@ def main():
         task_queues = [mp_ctx.Queue() for _ in range(args.num_clients)]
         reduce_queues = [mp_ctx.Queue() for _ in range(args.num_clients)]
         complete_queue = mp_ctx.Queue()
-        total_requests = args.num_clients * (args.warmup + args.iters)
+        # total_requests = args.num_clients * (args.warmup + args.iters)
+        total_requests = args.iters + args.warmup
         load_manager = OptimizedLoadManager(
             request_queue=request_queue,
             task_queues=task_queues,
