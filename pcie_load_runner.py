@@ -8,6 +8,7 @@ import statistics as stats
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.utils.cpp_extension
 
 from pcie_load_client import PcieLoadClient, PcieLoadProcess
 from kvcache_pcie_sim import (
@@ -80,6 +81,20 @@ def bind_cpu(rank: int, cores_per_proc: int):
     # os.environ["MKL_NUM_THREADS"] = str(cores_per_proc)
     # torch.set_num_threads(cores_per_proc)
     # torch.set_num_interop_threads(1)
+    
+def bind_cpu(rank: int, cores_per_proc: int, logger: logging.Logger):
+    start = rank * cores_per_proc
+    end = start + cores_per_proc
+    core_ids = list(range(start, end))
+
+    os.sched_setaffinity(0, core_ids)  # pid=0 means current process
+    
+    os.environ["OMP_NUM_THREADS"] = str(cores_per_proc)
+    os.environ["MKL_NUM_THREADS"] = str(cores_per_proc)
+    torch.set_num_threads(cores_per_proc)
+    torch.set_num_interop_threads(1)
+    
+    logger.info(f"Rank {rank} bound to CPU cores: {core_ids}, threads: {torch.get_num_threads()}")
 
 def run_client_baseline(rank, args):
     configure_logging(os.path.join(args.log_dir, f"client{rank + 1}.log"))
@@ -146,6 +161,7 @@ def run_client_baseline(rank, args):
 def run_client_optimized(rank, args, queues, host_caches):
     configure_logging(os.path.join(args.log_dir, f"client{rank + 1}.log"))
     logger = logging.getLogger(__name__)
+    bind_cpu(rank, args.cores_per_proc, logger)
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
@@ -165,6 +181,25 @@ def run_client_optimized(rank, args, queues, host_caches):
     block_elems = max(1, block_bytes // elem_size)
     block_bytes = block_elems * elem_size
     host_cache = host_caches[rank]
+    
+    cpp_source = open('custom_pinner.cpp', 'r').read()
+    module_name = 'custom_pinner_fixed'
+    try:
+        custom_pinner = torch.utils.cpp_extension.load_inline(
+            name=module_name,
+            cpp_sources=cpp_source,
+            verbose=True,
+            with_cuda=True
+        )
+    except Exception as e:
+        logger.info("\nCompilation failed. Please try: rm -rf ~/.cache/torch_extensions to clear cache and retry.")
+        raise e
+
+    logger.info("finish jit compile custom_pinner_fixed")
+    for cache in host_caches:
+        custom_pinner.pin_buffer(cache)
+        
+        
     if not host_cache.is_shared():
         raise SystemExit("Optimized mode requires shared host caches across processes.")
     gpu_cache = torch.empty((args.num_gpu_blocks, block_elems), dtype=dtype, device=device)
@@ -226,6 +261,7 @@ def run_client_optimized(rank, args, queues, host_caches):
         logger.info("Notes: bandwidth is per-rank based on H2D bytes and copy time.")
     logger.info("Rank %s shutting down load manager...", rank)
     load_manager.wait_for_shutdown()
+    custom_pinner.unpin_buffer(host_cache)
     dist.destroy_process_group()
 
 def run_manager_process(load_manager, log_file: str) -> None:
@@ -240,11 +276,11 @@ def main():
     logger = logging.getLogger(__name__)
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["baseline", "optimized"], default="baseline")
-    ap.add_argument("--num-gpu-blocks", type=int, default=256, help="Number of blocks in the KV cache per GPU.")
+    ap.add_argument("--num-gpu-blocks", type=int, default=64, help="Number of blocks in the KV cache per GPU.")
     ap.add_argument("--num-cpu-blocks", type=int, default=512, help="Number of blocks in the KV cache on CPU.")
-    ap.add_argument("--block-mb", type=float, default=16.0, help="Block size (MB) for each KV cache block.")
-    ap.add_argument("--read-min-blocks", type=int, default=32)
-    ap.add_argument("--read-max-blocks", type=int, default=32)
+    ap.add_argument("--block-mb", type=float, default=64.0, help="Block size (MB) for each KV cache block.")
+    ap.add_argument("--read-min-blocks", type=int, default=8)
+    ap.add_argument("--read-max-blocks", type=int, default=8)
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--pcie-util", type=float, default=70.0, help="Target PCIe utilization (0-100%).")

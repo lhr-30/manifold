@@ -174,7 +174,18 @@ class OptimizedLoadWorker:
         self._cpu_group = None
         if dist.is_initialized():
             self._cpu_group = dist.new_group(backend="gloo")
+        
+        block_elems = int(self.host_cache.shape[1])
+        dtype = self.host_cache.dtype
+        max_batch_blocks = 40
 
+        # pinned CPU staging buffer (important if you want non_blocking H2D)
+        self.tmp_cpu_buffer = torch.empty(
+            (max_batch_blocks, block_elems),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=bool(pin),
+        )
     @contextmanager
     def dist_lock(self, op: str, req: int, peer: int = -1):
         tid = threading.current_thread().name
@@ -214,13 +225,31 @@ class OptimizedLoadWorker:
         indices_gpu = task.indices_gpu
         self._task_indices[task.request_id] = indices_gpu
         host_cache = self.host_caches[task.host_cache_rank]
+        # cpu_copy_start = time.perf_counter()
+        # for idx, cpu_idx in enumerate(indices_cpu):
+        #     self.tmp_cpu_buffer.copy_(host_cache[cpu_idx], non_blocking=False)
+        # data_size = len(indices_cpu) * host_cache.shape[1] * host_cache.element_size() / 1e6
+        # logger.info(f"cpu copy time at rank {self.rank} for request id {task.request_id}: {time.perf_counter() - cpu_copy_start:.3f} seconds, data size: {data_size} MB, bandwidth: {data_size / 1e3 / (time.perf_counter() - cpu_copy_start)} GB/s")
+        logger.info(f"host cache is shared: {host_cache.is_shared()}")
         with torch.cuda.stream(self.stream):
             self.copy_start.record(self.stream)
             for cpu_idx, gpu_idx in zip(indices_cpu, indices_gpu):
                 self.gpu_cache[gpu_idx].copy_(host_cache[cpu_idx], non_blocking=self.pin)
             self.copy_end.record(self.stream)
         self.stream.synchronize()
-        logger.info(f"load time at rank {self.rank} for request id {task.request_id}: {self.copy_start.elapsed_time(self.copy_end) / 1e3:.3f} seconds")
+        data_size = len(indices_cpu) * host_cache.shape[1] * host_cache.element_size() / 1e6
+        logger.info(f"First read: load time at rank {self.rank} for request id {task.request_id}: {self.copy_start.elapsed_time(self.copy_end) / 1e3:.3f} seconds, data size: {data_size} MB, bandwidth: {data_size / 1e3 / (self.copy_start.elapsed_time(self.copy_end) / 1e3)} GB/s")
+        
+        # with torch.cuda.stream(self.stream):
+        #     self.copy_start.record(self.stream)
+        #     for idx, gpu_idx in enumerate(indices_gpu):
+        #         self.gpu_cache[gpu_idx].copy_(host_cache[idx], non_blocking=self.pin)
+        #     self.copy_end.record(self.stream)
+        # self.stream.synchronize()
+        # data_size = len(indices_cpu) * host_cache.shape[1] * host_cache.element_size() / 1e6
+        # logger.info(f"Second read: load time at rank {self.rank} for request id {task.request_id}: {self.copy_start.elapsed_time(self.copy_end) / 1e3:.3f} seconds, data size: {data_size} MB, bandwidth: {data_size / 1e3 / (self.copy_start.elapsed_time(self.copy_end) / 1e3)} GB/s")
+        
+        
         if task.owner_rank != self.rank:
             logger.debug(
                 "Worker rank %s, owner rank %s, send shards for request id %s",
