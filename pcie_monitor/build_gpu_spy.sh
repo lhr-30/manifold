@@ -1,0 +1,1 @@
+g++ -shared -fPIC -O3 -pthread -I/usr/local/cuda/include gpu_spy.cpp -o libgpu_spy.so -ldl -lrt
